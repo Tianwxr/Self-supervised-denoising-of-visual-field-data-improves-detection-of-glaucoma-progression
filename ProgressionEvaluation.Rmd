@@ -1,0 +1,949 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+#Libraries and Packages
+
+```{r}
+# options(install.packages.compile.from.source = "never")
+# install.packages("deldir")
+# library(deldir)
+# options(install.packages.compile.from.source = "interactive")
+library(stringr)
+library(visualFields)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(dplyr)
+library(broom)
+```
+
+
+#Load Raw and Autoencoded Data
+```{r}
+path = "drive/MyDrive/VisualField"
+
+L0 = c("True","P")
+L1 = c("_Vp","_Vnp","_Mp","_Mnp")
+L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+
+for (Data_type in L0) {
+  for (VF_type in L2) {
+    name = paste(VF_type, Data_type, sep="")
+    Temp = read.csv(paste(path, name, ".csv", sep=""))
+    assign(name, Temp)
+  }
+}
+
+for (Data_type in L1) {
+  for (VF_type in L2) {
+    name = paste(VF_type, Data_type, sep="")
+    # Temp = read.csv(paste(path, name, ".csv", sep=""), header = FALSE)
+    Temp = read.csv(paste(path, name, ".csv", sep=""))
+    assign(name, Temp)
+  }
+}
+```
+
+
+
+# ```{r}
+# AddC = function(vf1,vf2){
+#   vfn=cbind(vf2[,1:12],vf1[,1:25],rep(0,nrow(vf1)),vf1[,26:33],rep(0,nrow(vf1)),vf1[,34:52],vf2[,67])
+#   colnames(vfn)=colnames(vf2)
+#   return(vfn)
+# }
+# 
+# L1 = c("_Vp","_Vnp","_Mp","_Mnp")
+# L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+# 
+# for (Data_type in L1) {
+#   for (VF_type in L2) {
+#     name1 = paste(VF_type, Data_type, sep="")
+#     name2 = paste(VF_type, "True", sep="")
+#     Temp = AddC(get(name1),get(name2))
+#     assign(name1, Temp)
+#   }
+# }
+# ```
+
+
+# Custom and Helper Functions
+```{r}
+filterVF <- function(vf, DATEFORMAT = "%Y-%m-%d" ){
+  colnames(vf)[1:12] = c('EID','EYE', 'VISIT_DATE','time','age','type','fpr','fnr','fl','duration','VFI_x','MD_x')
+  vf$VISIT_DATE=as.Date(vf$VISIT_DATE, "%Y-%m-%d")
+  vf_res <- vf %>%
+    group_by(EID, EYE) 
+  vf_res <- vf_res %>%
+    select(c("EID", "EYE", "MD_x","VFI_x", "VISIT_DATE",'age','fpr','fnr','fl','type','time','simulation'),
+           matches("^L.*x$"), matches("^l[0-9]+")) %>%
+    rename_with(~str_replace(., "^l([0-9]+)$", "L_\\1_x"), starts_with("l")) %>%
+    mutate(VISIT_DATE = as.Date(VISIT_DATE, DATEFORMAT)) %>%
+    group_by(EID) %>%
+    mutate(FOLLOW_UP = as.numeric(VISIT_DATE - min(VISIT_DATE))/365.25,
+           num_follow = n(),
+           year_follow = max(FOLLOW_UP),) %>% 
+    distinct()
+  return(vf_res)
+}
+
+
+prepare_PLR <- function(test_data, filter_id = NULL, filter_eye = NULL){
+  
+  # Pre-process the data
+  selected_data <- test_data %>%
+    mutate(time = "00:00:00",
+           duration = "00:00:00",
+           type = "pwg",
+           L_26_x = NA,
+           L_35_x = NA,)%>%
+    mutate(EYE = if_else(EYE == "RE", "OD", if_else(EYE == "LE", "OS", "OU")))%>%
+    rename(id = EID, eye = EYE, date = VISIT_DATE)%>% 
+    distinct()
+  
+  # Filter the data if filter_id or filter_eye are not NULL
+  if (!is.null(filter_id)) {
+    selected_data <- selected_data %>% filter(id == filter_id)
+  }
+  if (!is.null(filter_eye)) {
+    selected_data <- selected_data %>% filter(eye == filter_eye)
+  }
+  
+  # Extract FOLLOW_UP to add it back later
+  follow_up <- selected_data$FOLLOW_UP
+  
+  # Keep these columns when you pass your data frame to the gettd function
+  pass_data <- selected_data %>% 
+    select(c("id", "eye", "date", "time", "age","type","fpr","fnr","fl","duration", matches("^L.*x$")))
+  
+  # Convert to data frame and get the TD
+  # gettd_result <- gettd(as.data.frame(pass_data))
+  gettd_result <- as.data.frame(pass_data)
+  
+  # # Get the data frame from gettdp and merge it with gettd_result
+  # gettdp_result <- gettdp(gettd_result)
+  # 
+  # # Combine the two data frames column-wise (assuming row alignment)
+  # gettd_result <- cbind(gettd_result, gettdp_result)
+  
+  # Add back the FOLLOW_UP column
+  gettd_result$FOLLOW_UP <- follow_up
+
+  
+  return(gettd_result)
+}
+
+
+# Function for PLR analysis
+PLR <- function(vf) {
+  # Convert the dataframe from wide to long format
+  # Filter out specific positions and group by id and position
+  # Perform linear regression on the sensitivity by FOLLOW_UP
+  res <- vf %>%
+    pivot_longer(cols = matches("^L.*x$"), names_to = "position", values_to = "sensitivity") %>%
+    filter(!(position %in% c("L_26_x", "L_35_x"))) %>%
+    group_by(id, position) %>%
+    do(fitEye = tidy(lm(sensitivity ~ FOLLOW_UP, data = .))) %>%
+    unnest(cols = c(fitEye)) %>%
+    filter(term == "FOLLOW_UP") %>%
+    
+    # Classify each progression based on p-value and estimate
+    mutate(eachProg = if_else(p.value < 0.01 & estimate <= -1, 1, 0)) %>%
+    group_by(id) %>%
+    # Sum up the progressions and flag id if cnt.pos >= 4
+    mutate(cnt.pos = sum(eachProg), prog = if_else(cnt.pos >= 3, 1, 0)) %>%
+    # Convert position to numeric
+    mutate(position = parse_number(position)) %>%
+    # Select relevant columns
+    select(c("id", "position", "estimate", "p.value", "cnt.pos", "prog"))
+  
+  return(res)
+}
+
+
+# Function to apply PLR analysis across different eyes and write to a CSV
+conv_PLR <- function(vf, fname) {
+  alleyes <- unique(vf$id)
+  res <- data.frame(matrix(ncol = 8, nrow = 0))
+  colnames(res) <- c("id", "position", "estimate", "p.value", "cnt.pos", "prog", "num_vis", "max_follow_up")
+
+  # Loop through each eye id
+  for (eye in alleyes) {
+    # Sort the data by FOLLOW_UP date
+    data <- vf[vf$id == eye,] %>% arrange(FOLLOW_UP)
+    num_tests <- dim(data)[1]
+    # print(eye)
+    # Require a minimum of 6 tests for the eye
+    if (num_tests >= 6) {
+      # Iterate through available tests
+      for (i in 1:(num_tests - 5)) {
+        # print(paste0("id ", eye, " Test No ", i))
+
+        # Run PLR on the first (5+i) tests
+        row <- PLR(data[1:(5 + i),])
+        row$num_vis <- 5 + i
+        row$max_follow_up <- data$FOLLOW_UP[5 + i]
+        
+        # Add the row to the results data frame
+        res <- res %>% add_row(row)
+      }
+    }
+  }
+  
+  # Write the result to a CSV file
+  write.csv(res, fname, row.names = FALSE)
+  return(res)
+}
+
+
+
+findProg <- function(convres){ # find overall prog result for all eyes
+  if ("id" %in% colnames(convres)){convres <- convres %>% rename(EID = id)} # rename EID for Poplr and MD results
+  
+  if ("position" %in% colnames(convres)) { # remove duplicate position in results of PLR, POPLR
+    splited <- convres %>% filter(position == 1) %>% group_by(EID) %>% group_split()}
+  else {splited <- convres %>% group_by(EID) %>% group_split()}
+  
+  res <- data.frame(matrix(ncol = 3, nrow = 0))
+  colnames(res) <- c("EID", "overall_prog", "convtime")
+  
+  for (df in splited){
+    progseq = df$prog
+    # 1. determine overall prog flag
+    if(sum(progseq) == 0) {overall_prog <-  0} # all test show no prog
+    else{
+      idx1 <- which(progseq == 1) # at least 1 test show signif
+      overall_prog <- min(idx1)}
+    
+    # 2. determine conversion time
+    if (overall_prog == 0){convtime <- NA} # non progressing
+    else {convtime <- df$max_follow_up[overall_prog]} # progressing at some time point  
+    
+    #3. save into result df
+    res <- res %>% add_row(EID = df$EID[1], 
+                           overall_prog = overall_prog, 
+                           convtime = convtime)
+  }
+  return(res)
+}
+
+# ---- Function to Compute Statistics for Progression ----
+
+compute_stats_prog <- function(dataframe_list) {
+  
+  # Check if input is a list
+  if(!is.list(dataframe_list)) stop("dataframes must be a list")
+  
+  # Internal function to perform calculations on a single dataframe
+  compute_stats_single <- function(df) {
+    # Calculate percentage of progression
+    prog_percentage <- (sum(df$overall_prog != 0) / nrow(df)) * 100
+    # Calculate average time for conversion
+    avg_convtime <- mean(df$convtime[df$overall_prog != 0], na.rm = TRUE)
+    # Calculate standard deviation for conversion time
+    sd_convtime <- sd(df$convtime[df$overall_prog != 0], na.rm = TRUE)
+    # Calculate average number of visits before conversion
+    avg_num_visits <- mean(df$overall_prog[df$overall_prog != 0], na.rm = TRUE)
+    # Calculate standard deviation for number of visits
+    sd_num_visits <- sd(df$overall_prog[df$overall_prog != 0], na.rm = TRUE)
+    # Calculate the number of eyes with progression
+    prog_eyes <- sum(df$overall_prog >= 1, na.rm = TRUE)
+    # Calculate the number of eyes without progression
+    non_prog_eyes <- sum(df$overall_prog == 0, na.rm = TRUE)
+    
+    return(data.frame(non_prog_eyes,prog_eyes, prog_percentage, avg_convtime, sd_convtime, avg_num_visits, sd_num_visits))
+  }
+  
+  # Apply internal function to each dataframe in the list
+  result <- lapply(dataframe_list, compute_stats_single)
+  
+  # Combine the list into a single data frame
+  result_df <- do.call(rbind, result)
+  
+  # Name the rows based on the original data frame names
+  rownames(result_df) <- names(dataframe_list)
+  
+  return(result_df)
+}
+
+library(dplyr)
+library(purrr)
+# Function to process each simulation subset
+process_simulation <- function(data, sim_number) {
+  filtered_data <- filterVF(data)
+  prepared_data <- prepare_PLR(filtered_data)
+  result_PLR_file_name <- paste0("simulation_", sim_number, "_mae_p_result_PLR.csv")
+  result_PLR <- conv_PLR(prepared_data, result_PLR_file_name)
+
+  result_PLR <- read.csv(result_PLR_file_name)
+  prog_PLR_file_name <- paste0("simulation_", sim_number, "_mae_p_prog_PLR.csv")
+  prog_PLR <- findProg(result_PLR)
+  write.csv(prog_PLR, prog_PLR_file_name, row.names = FALSE)
+
+  return(read.csv(prog_PLR_file_name))
+  return(filtered_data)
+}
+```
+
+
+
+```{r}
+path = "drive/MyDrive/VisualField"
+
+ProcessPLR = function(vf,name) {
+  filtered = filterVF(vf)
+  prepared = prepare_PLR(filtered)
+  conv = conv_PLR(prepared,paste(path, "conv", name, "PLR", ".csv", sep=""))
+}
+
+L1 = c("True","P","_Vp","_Vnp","_Mp","_Mnp")
+L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+
+
+
+for (Data_type in L1) {
+  for (VF_type in L2) {
+    name = paste(VF_type, Data_type, sep="")
+    ProcessPLR(get(name), name)
+  }
+}
+```
+
+
+
+```{r}
+path = "drive/MyDrive/VisualField"
+
+L1 = c("True","P","_Vp","_Vnp","_Mp","_Mnp")
+L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+PLRTable = c()
+
+for (Data_type in L2) {
+  ListName = paste(Data_type, "PLR", sep="")
+  L = list()
+  for (VF_type in L1) {
+    Temp1 = read.csv(paste(path, "conv" , Data_type, VF_type, "PLR", ".csv", sep=""))
+    Temp2 = findProg(Temp1)
+    L = append(L,list(Temp2))
+  }
+  PLRTable = cbind(PLRTable, compute_stats_prog(L)$prog_percentage)
+}
+
+rownames(PLRTable) = c("True data","Data with noise","Denoised with VAE with p-values","Denoised with VAE with no p-values","Denoised with MAE with p-values","Denoised with MAE with no p-values")
+colnames(PLRTable) = L2
+write.csv(PLRTable, paste(path, "PLRTable", ".csv", sep=""))
+```
+
+
+
+# GRI Analysis
+```{r}
+normalizer_v6 <- function(values, prog_Scores_UCLA) {
+  sum_Score <- values
+  
+  if (sum_Score == 0) {
+    return( c(values, 0) )
+  }
+  
+  min_Score <- 0
+  max_Score <- 0
+  
+  if (sum_Score < 0) {
+    min_Score <- min(prog_Scores_UCLA)
+    
+    ## If we're below our min, set to the min normalized
+    if (sum_Score < min_Score) {
+      sum_Score <- min_Score
+    }
+    
+    max_Score <- -1 * min(prog_Scores_UCLA) + 1
+    
+    sum_Score <- sum_Score * -1 + 1
+    
+    ## for log transform
+    min_Score <- 1
+    
+  } else if (sum_Score > 0) {
+    max_Score <- max(prog_Scores_UCLA)
+    sum_Score <- sum_Score + 1
+    
+    ## If we're above our max, set to the min normalized
+    if (sum_Score > max_Score) {
+      sum_Score <- max_Score
+    }
+    
+    
+    ## for log transform
+    min_Score <- 1
+  }
+  
+  
+  prog_Score_No_Log <- NULL
+  prog_Score_No_Log <- (sum_Score - min_Score) / (max_Score - min_Score)
+  if (values < 0) {
+    prog_Score_No_Log <- prog_Score_No_Log * -1
+    #prog_Score_Weighted <- prog_Score_Weighted - 1
+  }
+  prog_Score_No_Log <- prog_Score_No_Log * 100
+  
+  return( c(values, prog_Score_No_Log) )
+}
+#####################################################################
+#####################################################################
+
+#####################################################################
+#####################################################################
+FUN <- function(x, parameter, parameter2){
+  location <- x
+  dB <- curr_Locations[,x]
+  follow_Up <- parameter
+  age <- parameter2
+  
+  #print(x)
+  ###############################
+  # Regression
+  
+  ##Modifications
+  ###############################
+  # Exclusion Criteria for Regression
+  # Calculate the minimum number of elements to check in dB, limited to 3
+  EXCLUSION_CRITERIA__MIN_ZERO <- min(length(dB), 3)
+  # Check if the length of dB is greater than or equal to EXCLUSION_CRITERIA__MIN_ZERO
+  if (length(dB) >= EXCLUSION_CRITERIA__MIN_ZERO && sum(dB[1:EXCLUSION_CRITERIA__MIN_ZERO] == 0) >= 2) {
+    return(NA)
+  }
+  ###############################
+  
+  ##Modifications
+  ###############################
+  # # Age corrected
+  # temp_Age <- round(age/10)
+  # if (is.numeric(temp_Age) && !is.na(temp_Age))
+  # {
+  #   if (temp_Age == 0) { temp_Age <- 1}
+  #   ## For anyone above 100 we used 90
+  #   if (temp_Age > 9) { temp_Age <- 9 }
+  # 
+  #   age_Corrected <- subset(ageCorrectedData, ageCorrectedData[,1] == temp_Age)
+  # } else {
+  #   age_Corrected <- subset(ageCorrectedData, ageCorrectedData[,1] == 5)
+  # }
+  age_Corrected <- age
+  ###############################
+  
+  
+  ###############################
+  ## Cook's Distance
+  # Applied once, linear
+  # # Linear Regression
+  # Linear Regression
+  
+  ##Modifications
+  ###############################
+  #checks the length of db and whether dB is redundant becasue otherwise linear regression cannot be conducted
+  if (length(dB) >2 && length(unique(dB))!=1){
+  linear_Reg <- lm(dB ~ follow_Up)  
+  # Cook's Constant
+  cooks_Const <- 1
+  # Run the Cook's Distance
+  cooks_Res <- cooks.distance(linear_Reg)
+  # Find the indexes of the values less than or equal to the Cook's Constant
+  valid_Idx <- which(cooks_Res <= cooks_Const)
+  # Subset the values using the valid indexes
+  dB <- dB[valid_Idx]
+  follow_Up <- follow_Up[valid_Idx]
+  if(length(unique(follow_Up))==1){
+    dB<- curr_Locations[,x]
+    follow_Up <- parameter
+  }}
+  ###############################
+  
+  ###############################
+  # Studentized Residual
+  # Applied once, exp
+  residual_Const <- 3
+  linear_Reg <- lm(dB~follow_Up)
+  
+  if (linear_Reg$coefficients[2] < 0) {
+    #####################################
+    # Log Transform
+    dB_Log <- sapply(dB,thresholdLog)  
+    #####################################
+    
+    #####################################
+    # CAUTION
+    # If you perform lm on the follow vs threshold you get the wrong result
+    regression_Results <- NULL                                     
+    regression_Results <- lm(dB_Log~follow_Up)
+    #####################################
+  } else {
+    #####################################
+    # Log Transform
+    dB_Log <- sapply(age_Corrected - dB,thresholdLog)  
+    #####################################
+    
+    #####################################
+    # CAUTION
+    # If you perform lm on the follow vs threshold you get the wrong result
+    regression_Results <- NULL                                     
+    regression_Results <- lm(dB_Log~follow_Up)
+    #####################################
+  }
+  
+  result_1 <- resid(regression_Results)
+  result_2 <- rstandard(regression_Results)
+  result_3 <- rstudent(regression_Results)
+  
+  if (sum(result_1) == 0) { 
+    # do nothing
+  } else if (sum(abs(resid(regression_Results)) < 0.05) == length(result_1)) {
+    # Do nothing
+  } else if (sum(abs(round(result_2,3)) <= residual_Const) == length(result_2)) {
+    
+  } else {
+    result_3[is.nan(result_3)] <- 0
+    result_3[is.na(result_3)] <- 0
+    result_3 <- abs(result_3) > residual_Const
+    
+    ## Only keep what is less than the studentized
+    names(dB) <- result_3
+    names(follow_Up) <- result_3
+    dB[names(dB) == TRUE] <- -2
+    dB <- subset(dB, names(dB) == FALSE)
+    follow_Up <- subset(follow_Up, names(follow_Up) == FALSE) 
+  }
+  ###############################
+  
+  ##Modification
+  ###############################
+  # Regression
+  ##same modification as before
+  EXCLUSION_CRITERIA__MIN_ZERO <- min(length(dB), 3)
+  if (length(dB) >= EXCLUSION_CRITERIA__MIN_ZERO && sum(dB[1:EXCLUSION_CRITERIA__MIN_ZERO] == 0) >= 2) {
+    return(NA)
+  }
+  ###############################
+  
+  if (length(dB) >= MIN_VF_EXAMS) {
+    ## Years to fit
+    years_To_Fit <- NULL
+    years_To_Fit <- follow_Up
+    years_To_Fit <- data.frame(follow_Up = years_To_Fit)
+    
+    linear_Reg <- lm(dB~follow_Up)
+    
+    if (linear_Reg$coefficients[2] < 0) {
+      #####################################
+      # Log Transform
+      dB_Log <- sapply(dB,thresholdLog)  
+      #####################################
+      
+      #####################################
+      # CAUTION
+      # If you perform lm on the follow vs threshold you get the wrong result
+      regression_Results <- NULL                                     
+      regression_Results <- lm(dB_Log~follow_Up)
+      #####################################
+      
+      #####################################
+      ### Confidence Interval
+      confidence_Interval <- NULL
+      confidence_Interval <- exp(predict(regression_Results, years_To_Fit, interval = "confidence", level = ci_Level))
+      #####################################
+      
+      #####################################
+      ### Linear Approximation - Capped at Age Normal
+      x_Fit <- NULL
+      x_Fit <- c(head(exp(fitted(regression_Results)),1), tail(exp(fitted(regression_Results)),1))
+      if (x_Fit[1] > age_Corrected) { x_Fit[1] <- age_Corrected}
+      if (x_Fit[2] > age_Corrected) { x_Fit[2] <- age_Corrected}
+      
+      y_Fit <- c(head(follow_Up,1), tail(follow_Up,1))
+      
+      sproc <- lm(x_Fit~y_Fit)
+      sproc <- (sproc$coefficients[2]/age_Corrected)*100
+      #####################################
+    } else {
+      #####################################
+      # Log Transform
+      dB_Log <- sapply(age_Corrected - dB,thresholdLog)  
+      #####################################
+      
+      #####################################
+      # CAUTION
+      # If you perform lm on the follow vs threshold you get the wrong result
+      regression_Results <- NULL                                     
+      regression_Results <- lm(dB_Log~follow_Up)
+      #####################################
+      
+      #####################################
+      ### Confidence Interval
+      confidence_Interval <- NULL
+      confidence_Interval <- age_Corrected - exp(predict(regression_Results, years_To_Fit, interval = "confidence", level = ci_Level))
+      #####################################
+      
+      #####################################
+      ### Linear Approximation - Capped at Age Normal
+      x_Fit <- NULL
+      x_Fit <- sapply(age_Corrected-exp(fitted(regression_Results)), nonZero)
+      x_Fit <- c(head(x_Fit,1), tail(x_Fit,1))
+      if (x_Fit[1] > age_Corrected) { x_Fit[1] <- age_Corrected}
+      if (x_Fit[2] > age_Corrected) { x_Fit[2] <- age_Corrected}
+      
+      y_Fit <- c(head(follow_Up,1), tail(follow_Up,1))
+      
+      sproc <- lm(x_Fit~y_Fit)
+      sproc <- (sproc$coefficients[2]/age_Corrected)*100
+      #####################################
+    }
+    
+    
+    #####################################
+    lower <- confidence_Interval[,2]
+    lower <- c(head(lower,1), tail(lower, 1))
+    
+    upper <- confidence_Interval[,3]
+    upper <- c(head(upper,1), tail(upper, 1))
+    #####################################
+    
+    #####################################
+    # JC Method
+    # Dr. Caprioli:
+    # Fit the lower CI at time 0 and the higher CI at final FU
+    y_JC <- c(lower[1], upper[2])
+    x_JC <- c(head(follow_Up,1), tail(follow_Up,1))
+    
+    regresion_JC <- lm(y_JC~x_JC)
+    
+    ci_Slope <- regresion_JC$coefficients[2]
+    #####################################
+  } else {
+    return(NA)
+  }
+  ###############################
+  
+  ##Modification
+  ###############################
+  # if we had a positive beta, no change NA
+  if (regression_Results$coefficients[2] > 0 || linear_Reg$coefficients[2] == 0) {
+    return(NA)
+  } else if (linear_Reg$coefficients[2] > 0 && ci_Slope > 0) {
+    return(sproc)
+  } else if (linear_Reg$coefficients[2] < 0 && ci_Slope < decay_Rate( as.numeric(gsub("^L_([0-9]+)_.*", "\\1", location)))) {
+    return(sproc) ##used gsub rather than decay_Rate(as.numeric(strsplit(location, "L_")[[1]][2]), 2)) because the naming pattern is different in our dataset
+  } else {
+    return (NA)
+  } 
+}
+###############################
+
+# Function returns the result of a log
+# If the value is zero we return a special case
+thresholdLog <- function(x) {
+  if (x >= 1)
+  {
+    return ( log( x, base = exp(1) ) )
+  } else {    
+    #return (log(.00001))
+    # Decided by Dr. Caprioli and VF Meeting Team to treat Log(0) as Log(1) == 0
+    return (0)
+  }
+}
+#####################################################################
+#####################################################################
+
+############################################
+nonZero <- function(x) {
+  if ( x < 0 )
+    return (0)
+  else return (x)
+}
+############################################
+
+#####################################################################
+#####################################################################
+decay_Rate <- function(location, sd_Multiplier) {
+  rate <- NULL
+  
+  # 95%
+  if (location %in% c(13, 14, 15, 16, 22, 23, 24, 25)) {
+    rate <- -0.59 - (0*0.08)
+  } else if (location %in% c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 27)) {
+    rate <- -0.85 - (0*0.14)
+  } else if (location %in% c(31, 32, 33, 34, 39, 40, 41, 42)) {
+    rate <- -0.61 - (0*0.13)
+  } else if (location %in% c(28, 29, 30, 36, 37, 38, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54)) {
+    rate <- -0.61 - (0*0.14)
+  }
+  
+  # SD
+  # if (location %in% c(13, 14, 15, 16, 22, 23, 24, 25)) {
+  #   rate <- -0.53 - (sd_Multiplier*0.08)
+  # } else if (location %in% c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 27)) {
+  #   rate <- -0.79 - (sd_Multiplier*0.14)
+  # } else if (location %in% c(31, 32, 33, 34, 39, 40, 41, 42)) {
+  #   rate <- -0.51 - (sd_Multiplier*0.13)
+  # } else if (location %in% c(28, 29, 30, 36, 37, 38, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54)) {
+  #   rate <- -0.56 - (sd_Multiplier*0.14)
+  # }
+  
+  rate <- rate / 10
+  
+  return(rate)
+}
+
+GRI <- function(vf){
+  alleyes <- unique(vf$EID)
+  res <- data.frame(matrix(ncol = 4, nrow = 0))
+  colnames(res) <- c("EID", "estimate", "p.value", "prog")
+  
+    # print(1)
+  for (i in 1:length(alleyes)){
+    # print(i)
+    curr_eye <- vf[vf$EID == alleyes[i],]
+    
+    age <- curr_eye$age[1]
+    curr_fu <- curr_eye$FOLLOW_UP
+    curr_Locations <<- as.data.frame(subset(curr_eye, select=included_Locations))
+    
+    # Iterate over all the columns in curr_Locations
+    values <- sapply(colnames(curr_Locations), function(x) {
+      # Printing current column name and its index
+      # print(paste("Processing column:", x))
+      FUN(x, parameter = curr_fu, parameter2 = age)
+    })
+    
+    # print(paste("values:", values))
+    # Filter out NA values and sum the remaining ones
+    values <- sum(subset(values, !is.na(values)))
+    if (length(values) == 0) {
+      values <- 0
+    }
+    # print(paste("values:", values))
+    # Calculate the GRI score using normalizer_v6
+    gri_score <- normalizer_v6(values, prog_Scores_UCLA)[2]
+    
+    # Print the GRI score for the current iteration
+    # print(paste("GRI score for iteration", i, ":", gri_score))
+    
+    # Add results to the data frame
+    res <- res %>% add_row(EID=alleyes[i], 
+                           estimate = gri_score, 
+                           p.value = NA, 
+                           prog = if_else(gri_score < -6, 1, 0))
+    
+    # Print the iteration number to show progress
+    # print(paste("Processing iteration", i))
+  }
+  return(res)
+}
+##L_41x
+convGRI <- function(vf, fname){
+  alleyes <- unique(vf$EID)
+  res <- data.frame(matrix(ncol = 6, nrow = 0))
+  colnames(res) <- c("EID", "estimate", "p.value", "prog", "num_vis", "max_follow_up")
+  
+  for (eye in alleyes){
+    data <- vf[vf$EID ==eye,] %>% arrange(FOLLOW_UP) # order by visit date
+    num_tests <- dim(data)[1] #total num tests >=6
+    if (num_tests >= 6) {
+    # print(eye)
+    
+      for (i in 1:(num_tests - 5)){ #how many tests in total: 6 is 1, 7 is 2, 8 is 3
+        
+        row <- GRI(data[1:(5 + i),]) # 1:6, 1:7, 1:8
+        row$num_vis <- 5 +i # 6, 7, 8...
+        row$max_follow_up <- data$FOLLOW_UP[5+i]
+        # print(paste0("EID ", eye, " Test No ", i))
+        
+        res <- res %>% add_row(row)
+      }
+    }
+  }
+  write.csv(res,fname, row.names = FALSE)
+  return(res)
+}
+
+read_and_clean_GRI <- function(filename) {
+  df <- read.csv(filename)
+  df_clean <- df %>%
+    filter(!is.na(estimate))
+  return(df_clean)
+}
+```
+
+
+
+```{r}
+prog_Scores_UCLA <- c(-479.160216,0, 476.1545764)
+ci_Level <- 0.90
+MIN_VF_EXAMS <- 6
+included_Locations <- paste("L_", subset(seq(1:54), !(seq(1:54) %in% c(26, 35))), "_x", sep="")
+```
+
+
+
+```{r}
+path = "drive/MyDrive/VisualField"
+
+ProcessGRI <- function(data, name) {
+  filtered_data <- filterVF(data)
+  VF_data <- prepare_PLR(filtered_data)
+  VF_data<- VF_data %>%
+  rename(EID = id)
+  conv <- convGRI(VF_data, paste(path, "conv", name, "GRI", ".csv", sep=""))
+}
+
+L1 = c("True","P","_Vp","_Vnp","_Mp","_Mnp")
+L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+
+for (Data_type in L1) {
+  for (VF_type in L2) {
+    name = paste(VF_type, Data_type, sep="")
+    ProcessGRI(get(name), name)
+  }
+}
+```
+
+
+
+```{r}
+path = "drive/MyDrive/VisualField"
+
+L1 = c("True","P","_Vp","_Vnp","_Mp","_Mnp")
+L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+GRITable = c()
+
+for (Data_type in L2) {
+  ListName = paste(Data_type, "GRI", sep="")
+  L = list()
+  for (VF_type in L1) {
+    Temp1 = read_and_clean_GRI(paste(path, "conv" , Data_type, VF_type, "GRI", ".csv", sep=""))
+    Temp2 = findProg(Temp1)
+    L = append(L,list(Temp2))
+  }
+  GRITable = cbind(GRITable, compute_stats_prog(L)$prog_percentage)
+}
+
+rownames(GRITable) = c("True data","Data with noise","Denoised with VAE with p-values","Denoised with VAE with no p-values","Denoised with MAE with p-values","Denoised with MAE with no p-values")
+colnames(GRITable) = L2
+write.csv(GRITable, paste(path, "GRITable", ".csv", sep=""))
+```
+
+
+# MD Analysis
+```{r}
+# Define a function to perform reconstructed MD analysis.
+# The function takes a Visual Field (VF) data frame as input.
+MD <- function(VF) {
+  # Compute the Mean Deviation (MD) for each observation in the VF data
+  # MD is the row mean of columns that start with "l"
+  VF$MD <- rowMeans(select(VF, starts_with("l")), na.rm = TRUE)
+  
+  # Perform linear regression for MD against follow-up time (FOLLOW_UP),
+  # grouped by the 'id' variable.
+  res <- VF %>% 
+    group_by(id) %>% 
+    do(fitEye = tidy(lm(MD ~ FOLLOW_UP, data = .))) %>% 
+    unnest(fitEye) %>% 
+    filter(term == "FOLLOW_UP") %>%
+    mutate(prog = if_else(p.value < 0.05 & estimate <= -0.5, 1, 0)) %>%
+    select(id, estimate, p.value, prog)
+
+  # Joining back with the original VF dataframe to get the FOLLOW_UP values
+  res <- res %>% 
+    left_join(VF %>% select(id, FOLLOW_UP) %>% distinct(), by = "id")
+
+  return(res)
+}
+
+#conMD
+
+
+convMD <- function(VF, fname){
+  alleyes <- unique(VF$id)
+  res <- data.frame(matrix(ncol = 6, nrow = 0))
+  colnames(res) <- c("id", "estimate", "p.value", "prog", "num_vis", "max_follow_up")
+  
+  for (eye in alleyes){
+    # print(eye)
+    data <- VF[VF$id == eye,] %>% arrange(date) # order by visit date
+    num_tests <- dim(data)[1] #total num tests >=6
+    if (num_tests >= 6) {
+      for (i in 1:(num_tests - 5)){ #how many tests in total: 6 is 1, 7 is 2, 8 is 3
+        # print(paste0("EID ", eye, " Test No ", i))
+        
+        row <- MD(data[1:(5 + i),]) # 1:6, 1:7, 1:8
+        row$num_vis <- 5 +i # 6, 7, 8...
+        row$max_follow_up <- data$FOLLOW_UP[5+i]
+        res <- rbind(res, row[1,])
+        
+      }
+    }
+  }
+  write.csv(res, fname, row.names = FALSE)
+  return(res)
+}
+
+
+
+read_and_clean_MD <- function(filename) {
+  df <- read.csv(filename)
+  df_clean <- df %>%
+    filter(!is.na(estimate) & !is.na(prog))
+  return(df_clean)
+}
+
+
+```
+
+
+
+```{r}
+path = "drive/MyDrive/VisualField"
+
+ProcessMD <- function(data, name) {
+  filtered_data <- filterVF(data)
+  VF_data <- prepare_PLR(filtered_data)
+  conv <- convMD(VF_data, paste(path, "conv", name, "MD", ".csv", sep=""))
+}
+
+L1 = c("True","P","_Vp","_Vnp","_Mp","_Mnp")
+L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+
+for (Data_type in L1) {
+  for (VF_type in L2) {
+    name = paste(VF_type, Data_type, sep="")
+    ProcessMD(get(name), name)
+  }
+}
+```
+
+
+
+```{r}
+path = "drive/MyDrive/VisualField"
+
+L1 = c("True","P","_Vp","_Vnp","_Mp","_Mnp")
+L2 = c("DAge","DSlow","DMedium","DFast","SSlow","SMedium","SFast","MSlow","MMedium","MFast","LSlow","LMedium","LFast")
+MDTable = c()
+
+for (Data_type in L2) {
+  ListName = paste(Data_type, "MD", sep="")
+  L = list()
+  for (VF_type in L1) {
+    Temp1 = read_and_clean_MD(paste(path, "conv" , Data_type, VF_type, "MD", ".csv", sep=""))
+    Temp2 = findProg(Temp1)
+    L = append(L,list(Temp2))
+  }
+  MDTable = cbind(MDTable, compute_stats_prog(L)$prog_percentage)
+}
+
+rownames(MDTable) = c("True data","Data with noise","Denoised with VAE with p-values","Denoised with VAE with no p-values","Denoised with MAE with p-values","Denoised with MAE with no p-values")
+colnames(MDTable) = L2
+write.csv(MDTable, paste(path, "MDTable", ".csv", sep=""))
+```
